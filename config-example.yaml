@@ -2,7 +2,7 @@
 
 bot_token: 
 client_id: 
-status_message: 
+status_message: I was made by @suqsho
 
 max_text: 100000
 max_images: 5

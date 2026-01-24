@@ -13,3 +13,5 @@ config.yaml
 !docker-compose.yaml
 !render.yaml
 !requirements.txt
+!.github/
+!.github/**
