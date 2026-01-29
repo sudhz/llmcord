@@ -3,10 +3,12 @@ from aiohttp import web
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import logging
 import os
 from typing import Any, Literal, Optional
 
+from ddgs import DDGS
 import discord
 from discord.app_commands import Choice
 from discord.ext import commands
@@ -28,8 +30,31 @@ EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
 STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
+CHUNK_TIMEOUT_SECONDS = 30
 
 MAX_MESSAGE_NODES = 500
+
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": "Search the web for current information, news, facts, or anything you don't know or are unsure about",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+SEARCH_TIMEOUT_SECONDS = 5
+SEARCH_MAX_RESULTS = 5
+SEARCH_MAX_CHARS = 4000
 
 
 def get_config() -> dict[str, Any]:
@@ -46,6 +71,36 @@ def get_config() -> dict[str, Any]:
             cfg["providers"][provider]["api_key"] = api_key
 
     return cfg
+
+
+async def search_web(query: str) -> list[dict]:
+    """Execute web search using DDGS."""
+    def _search():
+        return list(DDGS().text(query, max_results=SEARCH_MAX_RESULTS))
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_search), timeout=SEARCH_TIMEOUT_SECONDS)
+    except (asyncio.TimeoutError, Exception) as e:
+        logging.warning(f"Search failed for '{query}': {e}")
+        return []
+
+
+def format_search_results(results: list[dict]) -> str:
+    """Format search results for LLM consumption, respecting char limit."""
+    if not results:
+        return "No results found."
+    
+    formatted = []
+    total_chars = 0
+    
+    for i, r in enumerate(results, 1):
+        entry = f"{i}. {r.get('title', 'No title')}\n   {r.get('body', '')}\n   URL: {r.get('href', '')}"
+        separator_len = 2 if formatted else 0  # "\n\n" between entries
+        if total_chars + separator_len + len(entry) > SEARCH_MAX_CHARS:
+            break
+        formatted.append(entry)
+        total_chars += separator_len + len(entry)
+    
+    return "\n\n".join(formatted)
 
 
 async def health_check(request):
@@ -286,7 +341,15 @@ async def on_message(new_msg: discord.Message) -> None:
     response_msgs = []
     response_contents = []
 
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    openai_kwargs = dict(
+        model=model,
+        messages=messages[::-1],
+        stream=True,
+        tools=[SEARCH_TOOL],
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        extra_body=extra_body
+    )
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -302,49 +365,149 @@ async def on_message(new_msg: discord.Message) -> None:
         msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
         await msg_nodes[response_msg.id].lock.acquire()
 
+    async def update_embed(description: str, color=EMBED_COLOR_INCOMPLETE) -> None:
+        embed.description = description
+        embed.color = color
+        if response_msgs:
+            await response_msgs[-1].edit(embed=embed)
+
+    async def execute_tool_call(tc: dict) -> dict:
+        try:
+            args = json.loads(tc["arguments"])
+            query = args.get("query", "")
+        except json.JSONDecodeError:
+            query = ""
+
+        truncated_query = f'{query[:50]}{"..." if len(query) > 50 else ""}'
+        if not use_plain_responses:
+            await update_embed(f'🔍 Searching: "{truncated_query}"')
+
+        results = await search_web(query)
+
+        if not use_plain_responses:
+            await update_embed(f"📊 Found {len(results)} result{'s' if len(results) != 1 else ''}, analyzing...")
+
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": format_search_results(results)
+        }
+
+    def accumulate_tool_call(tool_calls_buffer: dict, tc) -> None:
+        idx = tc.index
+        if idx not in tool_calls_buffer:
+            tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+        if tc.id:
+            tool_calls_buffer[idx]["id"] = tc.id
+        if tc.function and tc.function.name:
+            tool_calls_buffer[idx]["name"] = tc.function.name
+        if tc.function and tc.function.arguments:
+            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
+
+    async def stream_content(choice, search_count: int) -> None:
+        global last_task_time
+        nonlocal curr_content
+
+        prev_content = curr_content or ""
+        curr_content = choice.delta.content or ""
+        finish_reason = choice.finish_reason
+
+        new_content = prev_content if finish_reason is None else (prev_content + curr_content)
+
+        if not response_contents and not new_content:
+            return
+
+        start_next_msg = not response_contents or len(response_contents[-1] + new_content) > max_message_length
+        if start_next_msg:
+            response_contents.append("")
+
+        response_contents[-1] += new_content
+
+        if use_plain_responses or not response_contents[-1].strip():
+            return
+
+        time_delta = datetime.now().timestamp() - last_task_time
+        ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
+        msg_split_incoming = finish_reason is None and len(response_contents[-1] + curr_content) > max_message_length
+        is_final_edit = finish_reason is not None or msg_split_incoming
+        is_good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
+
+        if not (start_next_msg or ready_to_edit or is_final_edit):
+            return
+
+        if search_count > 0:
+            embed.set_footer(text="🔍" if search_count == 1 else f"🔍 ×{search_count}")
+
+        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+
+        if start_next_msg:
+            await reply_helper(embed=embed, silent=True)
+        else:
+            await asyncio.sleep(max(0, EDIT_DELAY_SECONDS - time_delta))
+            await response_msgs[-1].edit(embed=embed)
+
+        last_task_time = datetime.now().timestamp()
+
+    search_count = 0
+
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                if finish_reason != None:
+            api_messages = openai_kwargs.pop("messages")
+
+            while True:
+                tool_calls_buffer = {}
+                finish_reason = None
+                stream = await openai_client.chat.completions.create(messages=api_messages, **openai_kwargs)
+
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(stream.__anext__(), timeout=CHUNK_TIMEOUT_SECONDS)
+                    except (StopAsyncIteration, asyncio.TimeoutError):
+                        break
+
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if not choice:
+                        continue
+
+                    finish_reason = choice.finish_reason
+
+                    if choice.delta.tool_calls:
+                        for tc in choice.delta.tool_calls:
+                            accumulate_tool_call(tool_calls_buffer, tc)
+                        if not use_plain_responses and not response_msgs:
+                            embed.description = "🔍 Searching..."
+                            embed.color = EMBED_COLOR_INCOMPLETE
+                            await reply_helper(embed=embed, silent=True)
+                            response_contents.append("")
+
+                    elif choice.delta.content or finish_reason:
+                        await stream_content(choice, search_count)
+
+                    if finish_reason and finish_reason.lower() in ("stop", "end_turn"):
+                        break
+
+                if finish_reason != "tool_calls" or not tool_calls_buffer:
                     break
 
-                if not (choice := chunk.choices[0] if chunk.choices else None):
-                    continue
+                if response_contents:
+                    response_contents[-1] = ""
 
-                finish_reason = choice.finish_reason
+                assistant_tool_calls = [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for tc in (tool_calls_buffer[idx] for idx in sorted(tool_calls_buffer.keys()))
+                ]
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
+                tool_results = []
+                for idx in sorted(tool_calls_buffer.keys()):
+                    tc = tool_calls_buffer[idx]
+                    if tc["name"] == "search_web":
+                        tool_results.append(await execute_tool_call(tc))
+                        search_count += 1
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
-
-                if response_contents == [] and new_content == "":
-                    continue
-
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
-
-                response_contents[-1] += new_content
-
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
-
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msgs[-1].edit(embed=embed)
-
-                        last_task_time = datetime.now().timestamp()
+                api_messages.append({"role": "assistant", "tool_calls": assistant_tool_calls})
+                api_messages.extend(tool_results)
+                curr_content = None
 
             if use_plain_responses:
                 for content in response_contents:
@@ -352,6 +515,18 @@ async def on_message(new_msg: discord.Message) -> None:
 
     except Exception:
         logging.exception("Error while generating response")
+
+    finally:
+        if not use_plain_responses and response_msgs and response_contents and response_contents[-1].strip():
+            is_good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
+            embed.description = response_contents[-1]
+            embed.color = EMBED_COLOR_COMPLETE if is_good_finish else EMBED_COLOR_INCOMPLETE
+            if search_count > 0:
+                embed.set_footer(text="🔍" if search_count == 1 else f"🔍 ×{search_count}")
+            try:
+                await response_msgs[-1].edit(embed=embed)
+            except Exception:
+                logging.exception("Error during final embed edit")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
