@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import re
 import signal
 from typing import Any, Literal, Optional
 
@@ -48,6 +49,24 @@ SEARCH_TOOL = {
                 }
             },
             "required": ["query"]
+        }
+    }
+}
+
+PROFILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_discord_profile",
+        "description": "Look up a Discord user's profile information by user ID",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "Discord user ID, with or without mention syntax"
+                }
+            },
+            "required": ["user_id"]
         }
     }
 }
@@ -100,6 +119,70 @@ async def search_web(query: str, httpx_client: httpx.AsyncClient, api_key: str) 
     except Exception as e:
         logging.warning(f"Perplexity search failed for '{query}': {e}")
         return "Search failed. No results available."
+
+
+_DISCORD_ID_RE = re.compile(r"^(?:<@!?)?(\d+)>?$")
+
+
+def parse_discord_user_id(raw_user_id: str) -> Optional[int]:
+    m = _DISCORD_ID_RE.match(str(raw_user_id).strip())
+    return int(m.group(1)) if m else None
+
+
+async def get_discord_profile(user_id: str, guild: Optional[discord.Guild], bot: commands.Bot) -> str:
+    parsed_user_id = parse_discord_user_id(user_id)
+    if parsed_user_id is None:
+        return f"Profile lookup failed: invalid user ID '{user_id}'."
+
+    member = None
+    user = None
+
+    if guild is not None:
+        try:
+            member = guild.get_member(parsed_user_id) or await guild.fetch_member(parsed_user_id)
+            user = member
+        except discord.NotFound:
+            member = None
+        except discord.HTTPException:
+            logging.exception("Failed to fetch member %s from guild %s", parsed_user_id, guild.id)
+
+    if user is None:
+        try:
+            user = bot.get_user(parsed_user_id) or await bot.fetch_user(parsed_user_id)
+        except discord.NotFound:
+            return f"No Discord user found for ID {parsed_user_id}."
+        except discord.HTTPException:
+            logging.exception("Failed to fetch user %s", parsed_user_id)
+            return f"Profile lookup failed for ID {parsed_user_id}."
+
+    lines = [
+        f"User ID: {parsed_user_id}",
+        f"Mention: <@{parsed_user_id}>",
+        f"Username: {user.name}",
+        f"Display Name: {user.display_name}",
+        f"Bot Account: {'yes' if user.bot else 'no'}",
+        f"Avatar URL: {user.display_avatar.url}",
+        f"Account Created: {user.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+    ]
+
+    if member is not None:
+        if guild is not None:
+            lines.append(f"Server: {guild.name}")
+
+        if member.nick:
+            lines.append(f"Server Nickname: {member.nick}")
+
+        if member.joined_at:
+            lines.append(f"Joined Server: {member.joined_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+        role_names = [role.name for role in member.roles if role.name != "@everyone"]
+        lines.append(f"Top Role: {member.top_role.name}")
+        lines.append(f"Roles: {', '.join(reversed(role_names)) if role_names else 'none'}")
+    elif guild is not None:
+        lines.append(f"Server: {guild.name}")
+        lines.append("Server Member Data: unavailable")
+
+    return "\n".join(lines)
 
 
 async def health_check(request):
@@ -295,7 +378,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
         async with curr_node.lock:
             if curr_node.text == None:
-                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+                cleaned_content = curr_msg.content.replace(f"<@!{discord_bot.user.id}>", discord_bot.user.display_name).replace(discord_bot.user.mention, discord_bot.user.display_name).strip()
 
                 good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
 
@@ -372,8 +455,8 @@ async def on_message(new_msg: discord.Message) -> None:
         now = datetime.now().astimezone()
 
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
-        if accept_usernames:
-            system_prompt += "\n\nUser's names are their Discord IDs and should be typed as '<@ID>'."
+        system_prompt += "\n\nYour responses are displayed in Discord's UI. When you write '<@ID>' it renders as a clickable mention showing the user's display name — never repeat the display name next to a mention. Use mention format when referring to users, and call get_discord_profile if you need details about a mentioned user."
+        system_prompt += f"\n\nThe user sending this message is <@{new_msg.author.id}> (display name: {new_msg.author.display_name})."
 
         messages.append(dict(role="system", content=system_prompt))
 
@@ -386,7 +469,7 @@ async def on_message(new_msg: discord.Message) -> None:
         model=model,
         messages=messages[::-1],
         stream=True,
-        tools=[SEARCH_TOOL],
+        tools=[SEARCH_TOOL, PROFILE_TOOL],
         extra_headers=extra_headers,
         extra_query=extra_query,
         extra_body=extra_body
@@ -412,7 +495,7 @@ async def on_message(new_msg: discord.Message) -> None:
         if response_msgs:
             await response_msgs[-1].edit(embed=embed)
 
-    async def execute_tool_call(tc: dict) -> dict:
+    async def execute_search_call(tc: dict) -> dict:
         try:
             args = json.loads(tc["arguments"])
             query = args.get("query", "")
@@ -428,6 +511,28 @@ async def on_message(new_msg: discord.Message) -> None:
 
         if not use_plain_responses:
             await update_embed("📊 Analyzing results...")
+
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": result
+        }
+
+    async def execute_profile_call(tc: dict) -> dict:
+        try:
+            args = json.loads(tc["arguments"])
+            user_id = str(args.get("user_id", ""))
+        except json.JSONDecodeError:
+            user_id = ""
+
+        truncated_user_id = f'{user_id[:50]}{"..." if len(user_id) > 50 else ""}'
+        if not use_plain_responses:
+            await update_embed(f'👤 Looking up: "{truncated_user_id}"')
+
+        result = await get_discord_profile(user_id, new_msg.guild, discord_bot)
+
+        if not use_plain_responses:
+            await update_embed("📊 Analyzing profile...")
 
         return {
             "role": "tool",
@@ -518,7 +623,7 @@ async def on_message(new_msg: discord.Message) -> None:
                         for tc in choice.delta.tool_calls:
                             accumulate_tool_call(tool_calls_buffer, tc)
                         if not use_plain_responses and not response_msgs:
-                            embed.description = "🔍 Searching..."
+                            embed.description = "🛠️ Running tools..."
                             embed.color = EMBED_COLOR_INCOMPLETE
                             await reply_helper(embed=embed, silent=True)
                             response_contents.append("")
@@ -544,8 +649,16 @@ async def on_message(new_msg: discord.Message) -> None:
                 for idx in sorted(tool_calls_buffer.keys()):
                     tc = tool_calls_buffer[idx]
                     if tc["name"] == "search_web":
-                        tool_results.append(await execute_tool_call(tc))
+                        tool_results.append(await execute_search_call(tc))
                         search_count += 1
+                    elif tc["name"] == "get_discord_profile":
+                        tool_results.append(await execute_profile_call(tc))
+                    else:
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": f"Unknown tool '{tc['name']}'."
+                        })
 
                 api_messages.append({"role": "assistant", "tool_calls": assistant_tool_calls})
                 api_messages.extend(tool_results)
