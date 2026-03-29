@@ -11,7 +11,8 @@ config.yaml
 !Dockerfile
 !config-example.yaml
 !docker-compose.yaml
-!render.yaml
 !requirements.txt
+!scripts/
+!scripts/**
 !.github/
 !.github/**

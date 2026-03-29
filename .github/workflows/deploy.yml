@@ -3,18 +3,121 @@ name: Deploy
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       deployments: write
+    env:
+      ALWAYSDATA_ACCOUNT: suqshobots
+      ALWAYSDATA_HOST: ssh-suqshobots.alwaysdata.net
+      ALWAYSDATA_SERVICE_ID: "22309"
+      DEPLOY_PATH: /home/suqshobots/bots/suqshos-ai
+      REPO_URL: https://github.com/sudhz/suqshos-ai.git
+      PYTHON_BIN: python3
+      DEPLOYMENT_ENVIRONMENT: production
     steps:
-      - uses: JorgeLNJunior/render-deploy@v1.4.7
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub deployment
+        id: github_deployment
+        uses: actions/github-script@v7
         with:
-          service_id: ${{ secrets.RENDER_SERVICE_ID }}
-          api_key: ${{ secrets.RENDER_API_KEY }}
-          clear_cache: true
-          wait_deploy: true
-          github_deployment: true
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: process.env.DEPLOYMENT_ENVIRONMENT,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: false,
+              production_environment: true,
+              description: 'Deploy to alwaysdata',
+            });
+
+            core.setOutput('deployment_id', String(deployment.data.id));
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'in_progress',
+              environment: process.env.DEPLOYMENT_ENVIRONMENT,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment in progress',
+            });
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.ALWAYSDATA_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$ALWAYSDATA_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy code on alwaysdata
+        run: |
+          chmod +x scripts/deploy-remote.sh
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 "$ALWAYSDATA_ACCOUNT@$ALWAYSDATA_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' REPO_URL='$REPO_URL' PYTHON_BIN='$PYTHON_BIN' sh -s" < scripts/deploy-remote.sh
+
+      - name: Restart alwaysdata service
+        id: restart_service
+        run: |
+          service_log_path="/home/suqshobots/admin/logs/services/$(date +%Y)/$ALWAYSDATA_SERVICE_ID-$(date +%F).log"
+          service_log_lines=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 "$ALWAYSDATA_ACCOUNT@$ALWAYSDATA_HOST" \
+            "test -f '$service_log_path' && wc -l < '$service_log_path' || printf '0'")
+          printf 'service_log_path=%s\n' "$service_log_path" >> "$GITHUB_OUTPUT"
+          printf 'service_log_lines=%s\n' "$service_log_lines" >> "$GITHUB_OUTPUT"
+
+          curl --fail --silent --show-error \
+            --basic \
+            --user "${{ secrets.ALWAYSDATA_API_TOKEN }} account=$ALWAYSDATA_ACCOUNT:" \
+            --request POST \
+            "https://api.alwaysdata.com/v1/service/$ALWAYSDATA_SERVICE_ID/restart/"
+
+      - name: Verify service startup
+        run: |
+          start_line=$(( ${{ steps.restart_service.outputs.service_log_lines }} + 1 ))
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 "$ALWAYSDATA_ACCOUNT@$ALWAYSDATA_HOST" \
+              "test -f '${{ steps.restart_service.outputs.service_log_path }}' && sed -n '${start_line},\\$p' '${{ steps.restart_service.outputs.service_log_path }}'" \
+              | rg -q 'Health check server running on port 8301|has connected to Gateway'; then
+              exit 0
+            fi
+            sleep 3
+          done
+          exit 1
+
+      - name: Mark GitHub deployment success
+        if: success() && steps.github_deployment.outputs.deployment_id != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: Number('${{ steps.github_deployment.outputs.deployment_id }}'),
+              state: 'success',
+              environment: process.env.DEPLOYMENT_ENVIRONMENT,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment finished successfully',
+            });
+
+      - name: Mark GitHub deployment failure
+        if: failure() && steps.github_deployment.outputs.deployment_id != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: Number('${{ steps.github_deployment.outputs.deployment_id }}'),
+              state: 'failure',
+              environment: process.env.DEPLOYMENT_ENVIRONMENT,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment failed',
+            });
