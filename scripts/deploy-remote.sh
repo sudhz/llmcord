@@ -16,12 +16,10 @@ if [ ! -d "$DEPLOY_PATH/.git" ]; then
   mkdir -p "$DEPLOY_PATH"
   git -C "$DEPLOY_PATH" init
   git -C "$DEPLOY_PATH" remote add origin "$REPO_URL"
-  git -C "$DEPLOY_PATH" fetch --depth 1 origin main
-  git -C "$DEPLOY_PATH" checkout -B main FETCH_HEAD
-else
-  git -C "$DEPLOY_PATH" checkout main
-  git -C "$DEPLOY_PATH" pull --ff-only origin main
 fi
+
+git -C "$DEPLOY_PATH" fetch --depth 1 origin main
+git -C "$DEPLOY_PATH" checkout -B main FETCH_HEAD
 
 cd "$DEPLOY_PATH"
 chmod +x scripts/start-service.sh scripts/deploy-remote.sh
