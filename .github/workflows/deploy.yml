@@ -67,9 +67,10 @@ jobs:
       - name: Restart alwaysdata service
         id: restart_service
         run: |
-          service_log_path="/home/suqshobots/admin/logs/services/$(date +%Y)/$ALWAYSDATA_SERVICE_ID-$(date +%F).log"
-          service_log_lines=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 "$ALWAYSDATA_ACCOUNT@$ALWAYSDATA_HOST" \
-            "test -f '$service_log_path' && wc -l < '$service_log_path' || printf '0'")
+          service_info=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 "$ALWAYSDATA_ACCOUNT@$ALWAYSDATA_HOST" \
+            "path=\"/home/suqshobots/admin/logs/services/\$(date +%Y)/$ALWAYSDATA_SERVICE_ID-\$(date +%F).log\"; printf '%s %s\n' \"\$path\" \"\$(test -f \"\$path\" && wc -l < \"\$path\" || printf '0')\"")
+          service_log_path=$(printf '%s' "$service_info" | cut -d' ' -f1)
+          service_log_lines=$(printf '%s' "$service_info" | cut -d' ' -f2)
           printf 'service_log_path=%s\n' "$service_log_path" >> "$GITHUB_OUTPUT"
           printf 'service_log_lines=%s\n' "$service_log_lines" >> "$GITHUB_OUTPUT"
 
