@@ -75,9 +75,15 @@ SEARCH_TIMEOUT_SECONDS = 30
 
 
 def get_config() -> dict[str, Any]:
-    filename = "config.yaml" if os.path.exists("config.yaml") else "config-example.yaml"
-    with open(filename, encoding="utf-8") as file:
-        cfg = yaml.safe_load(file)
+    with open("config-example.yaml", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if os.path.exists("config.yaml"):
+        with open("config.yaml", encoding="utf-8") as f:
+            local = yaml.safe_load(f) or {}
+        for key, val in local.items():
+            if key not in ("providers", "models"):
+                cfg[key] = val
 
     if bot_token := os.environ.get("BOT_TOKEN"):
         cfg["bot_token"] = bot_token
@@ -87,37 +93,38 @@ def get_config() -> dict[str, Any]:
         if api_key := os.environ.get(env_key):
             cfg["providers"][provider]["api_key"] = api_key
 
-    if perplexity_key := os.environ.get("PERPLEXITY_API_KEY"):
-        cfg["perplexity_api_key"] = perplexity_key
-
     return cfg
 
 
 async def search_web(query: str, httpx_client: httpx.AsyncClient, api_key: str) -> str:
-    """Search the web using Perplexity Sonar API."""
     try:
         response = await httpx_client.post(
-            "https://api.perplexity.ai/chat/completions",
+            "https://api.mistral.ai/v1/conversations",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": "sonar-pro",
-                "messages": [{"role": "user", "content": query}],
-                "search_recency_filter": "month",
-                "return_citations": True,
+                "model": "mistral-medium-latest",
+                "tools": [{"type": "web_search"}],
+                "inputs": query,
+                "store": False,
             },
             timeout=SEARCH_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         data = response.json()
 
-        content = data["choices"][0]["message"]["content"]
-        citations = data.get("citations", [])
-        if citations:
-            content += "\n\nSources:\n" + "\n".join(f"[{i+1}] {url}" for i, url in enumerate(citations))
+        message_entry = next((o for o in data.get("outputs", []) if o.get("type") == "message.output"), None)
+        if not message_entry:
+            return "Search failed. No results available."
 
-        return content
+        content_blocks = message_entry.get("content", [])
+        text = "".join(b["text"] for b in content_blocks if b.get("type") == "text")
+        citations = [b["url"] for b in content_blocks if b.get("type") == "tool_reference" and b.get("url")]
+        if citations:
+            text += "\n\nSources:\n" + "\n".join(f"[{i+1}] {url}" for i, url in enumerate(citations))
+
+        return text or "Search returned no content."
     except Exception as e:
-        logging.warning(f"Perplexity search failed for '{query}': {e}")
+        logging.warning(f"Mistral web search failed for '{query}': {e}")
         return "Search failed. No results available."
 
 
@@ -506,8 +513,8 @@ async def on_message(new_msg: discord.Message) -> None:
         if not use_plain_responses:
             await update_embed(f'🔍 Searching: "{truncated_query}"')
 
-        perplexity_key = config.get("perplexity_api_key", "")
-        result = await search_web(query, httpx_client, perplexity_key)
+        mistral_key = config.get("providers", {}).get("mistral", {}).get("api_key", "")
+        result = await search_web(query, httpx_client, mistral_key)
 
         if not use_plain_responses:
             await update_embed("📊 Analyzing results...")

@@ -26,10 +26,6 @@ permissions:
     blocked_ids: []
 
 
-# Search settings (Perplexity Sonar API):
-
-perplexity_api_key:
-
 # LLM settings:
 
 providers:
@@ -78,7 +74,7 @@ providers:
     base_url: http://localhost:8000/v1
 
 models:
-  deepinfra/deepseek-ai/DeepSeek-V3.2:
+  mistral/mistral-medium-latest:
 
 system_prompt: |
   You are suqsho's AI, a snarky Discord chatbot made by suqsho. Be informative but harsh.
